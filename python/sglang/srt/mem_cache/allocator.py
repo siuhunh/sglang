@@ -170,6 +170,47 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
+# pytorch tensor operation instead of triton kernel
+def alloc_extend_naive_ascend(
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        free_pages,
+        out_indices,
+        page_size,
+        device,
+):
+    token_num = (seq_lens - prefix_lens).to(dtype=torch.int32)  # the token num of each sequence need to extend
+    last_loc = last_loc.to(dtype=torch.int32)                   # last location for the last token in each sequence
+    free_pool = free_pages.to(dtype=torch.int32)                # free page pool
+
+    cur_page_loc = (last_loc + page_size) // page_size - 1         # current page id
+    new_page = (last_loc + token_num) // page_size - cur_page_loc  # count the number of new pages for extending seq
+
+    # extend new page idx and fill by cur_page_loc for each seq,
+    page_id_map = torch.repeat_interleave(cur_page_loc, new_page + 1)
+    # new pages loc in page_id_map
+    tar_head_pos = torch.repeat_interleave(torch._dim_arange(new_page, dim=0) + 1, new_page)
+    fill = torch._dim_arange(tar_head_pos, dim=0)
+
+    # new page and free pool page_id matching
+    page_id_map[tar_head_pos + fill] = free_pool[fill]
+
+    # count each sequence offsets, make sure extend part for each sequence contiguous
+    seq_offsets = (torch.cumsum(new_page + 1) - (new_page + 1) - cur_page_loc) * page_size - \
+               (torch.cumsum(token_num) - token_num) + last_loc + 1
+
+    # per token offsets
+    token_offsets = torch.repeat_interleave(seq_offsets, token_num)
+    # token idx
+    idx = torch._dim_arange(token_offsets, dim=0) + token_offsets
+
+    page_starts = page_id_map * page_size
+    map_indices = idx // page_size
+    page_offsets = idx % page_size
+    output = page_starts[map_indices] + page_offsets
+
+    out_indices[:] = output.to(dtype=output.dtype)
 
 def alloc_extend_naive(
     prefix_lens,
